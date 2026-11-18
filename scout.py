@@ -9,9 +9,11 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 ROOT = Path(__file__).parent
 DATA_DIR = ROOT / "data"
@@ -59,10 +61,89 @@ def check_link_status(url: str) -> str:
     except Exception:
         return "unknown"
 
+# ─── Indeed jk= link converter ───
+def convert_indeed_link(url: str) -> str:
+    """Converte link Indeed jk= para URL do anúncio direto se possível."""
+    parsed = urlparse(url)
+    if "indeed" not in parsed.netloc:
+        return url
+    
+    qs = parse_qs(parsed.query)
+    if "jk" in qs:
+        jk = qs["jk"][0]
+        # Tenta construir URL do anúncio direto
+        # indeed.com/viewjob?jk=XXXX
+        new_query = urlencode({"jk": jk}, doseq=True)
+        new_parsed = parsed._replace(path="/viewjob", query=new_query)
+        return urlunparse(new_parsed)
+    return url
+
+def extract_job_urls_from_search_page(content: str, base_domain: str) -> List[str]:
+    """Extrai URLs de vagas individuais de uma página de busca."""
+    urls = []
+    # Padrões comuns para links de vagas
+    patterns = [
+        r'href=["\'](/job/[^"\']+)["\']',
+        r'href=["\'](/position/[^"\']+)["\']',
+        r'href=["\'](/vacancy/[^"\']+)["\']',
+        r'href=["\'](/career/[^"\']+)["\']',
+        r'href=["\'](/emprego/[^"\']+)["\']',
+        r'href=["\'](/viewjob\?jk=[^"\']+)["\']',
+        r'href=["\'](https://[^"\']+/job/[^"\']+)["\']',
+        r'href=["\'](https://[^"\']+/position/[^"\']+)["\']',
+        r'href=["\'](https://[^"\']+/vacancy/[^"\']+)["\']',
+    ]
+    for pat in patterns:
+        matches = re.findall(pat, content, re.IGNORECASE)
+        for m in matches:
+            if m.startswith("http"):
+                urls.append(m)
+            elif m.startswith("/"):
+                urls.append(f"https://{base_domain}{m}")
+    return list(set(urls))
+
+def is_search_page(url: str) -> bool:
+    """Detecta se é página de busca (lista) vs anúncio individual."""
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    netloc = parsed.netloc.lower()
+    
+    # Páginas de busca têm padrões específicos
+    search_patterns = [
+        "/jobs", "/q-", "/search", "/ofertas", "/vagas", "/empregos",
+        "/srch_il", "/job/search", "/jobs/search", "/list", "/browse",
+        "/jobs/",  # Glassdoor /Job/... search pages
+    ]
+    # Páginas de anúncio individual - padrões mais específicos
+    job_patterns = [
+        "/viewjob", 
+        "/job/",  # generic but need to exclude search
+        "/position/", 
+        "/vacancy/", 
+        "/career/", 
+        "/emprego/",
+        "/job-",  # job-12345
+        "/vaga-",
+    ]
+    
+    # Verifica se é claramente uma página de busca
+    is_search = any(p in path for p in search_patterns)
+    
+    # Verifica se é claramente um anúncio individual
+    # Mas exclui se for padrão de busca do Glassdoor (/Job/...SRCH...)
+    if "glassdoor" in netloc and "/job/" in path and "srch" in path.lower():
+        return True
+    if "linkedin" in netloc and "/jobs/" in path and ("search" in path or "guest" in path):
+        return True
+    
+    is_job = any(p in path for p in job_patterns)
+    
+    # Se tem padrão de job E não é busca, é anúncio
+    if is_job and not is_search:
+        return False
+    return is_search
+
 def load_skills_metric() -> Dict:
-    """Carrega e parseia skills-metric.md para pesos."""
-    content = (DATA_DIR / "skills-metric.md").read_text(encoding="utf-8")
-    # Parse simples da tabela de fatores
     weights = {
         "nivel": 0.20,
         "ia": 0.15,
@@ -74,65 +155,144 @@ def load_skills_metric() -> Dict:
     }
     return weights
 
+def extract_salary_from_text(text: str) -> str:
+    """Extrai menção de salário do texto."""
+    patterns = [
+        r"€\s*[\d,.]+\s*[–-]\s*€?\s*[\d,.]+",  # €1200–€2000
+        r"€\s*[\d,.]+\s*[–-]\s*[\d,.]+",        # €1200–2000
+        r"[\d,.]+\s*[–-]\s*[\d,.]+\s*€",        # 1200–2000€
+        r"salário[:\s]*€?\s*[\d,.]+",            # salário: €1500
+        r"salary[:\s]*€?\s*[\d,.]+",             # salary: €1500
+        r"remunera[çc][ao][:\s]*€?\s*[\d,.]+",  # remuneração: €1500
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(0)
+    return ""
+
+def extract_requirements(text: str) -> List[str]:
+    """Extrai requisitos técnicos do texto da vaga."""
+    tech_keywords = [
+        "python", "sql", "javascript", "typescript", "java", "c#", "go", "rust",
+        "react", "vue", "angular", "node", "django", "flask", "fastapi",
+        "aws", "azure", "gcp", "docker", "kubernetes", "terraform",
+        "machine learning", "ml", "ai", "llm", "pytorch", "tensorflow",
+        "pandas", "numpy", "spark", "kafka", "redis", "postgresql", "mysql",
+        "git", "ci/cd", "jenkins", "github actions", "gitlab",
+        "tableau", "power bi", "looker", "excel", "powerpoint",
+        "photoshop", "figma", "jira", "confluence",
+    ]
+    found = []
+    text_lower = text.lower()
+    for kw in tech_keywords:
+        if kw in text_lower:
+            found.append(kw)
+    return list(set(found))
+
 def score_vaga(vaga: Dict, profile: Dict, weights: Dict) -> Dict:
-    """Aplica skills-metric.md a uma vaga. Retorna vaga com score e fatores."""
-    # Extrai requisitos da vaga (do scrape ou busca)
     descricao = (vaga.get("description") or vaga.get("markdown") or "").lower()
-    titulo = (vaga.get("title") or "").lower()
-    empresa = (vaga.get("source") or vaga.get("url") or "").lower()
-    localizacao_vaga = (vaga.get("location") or "").lower()
+    titulo = (vaga.get("titulo") or vaga.get("title") or "").lower()
+    localizacao_vaga = (vaga.get("localizacao") or vaga.get("location") or "").lower()
+    salary_text = (vaga.get("salary") or extract_salary_from_text(descricao) or "").lower()
     
     # Perfil do usuário
-    habilidades_user = [h.strip().lower() for h in profile.get("Habilidades técnicas", "").split(",")]
+    habilidades_user = [h.strip().lower() for h in profile.get("Habilidades técnicas", "").split(",") if h.strip()]
     area_user = profile.get("Área de interesse", "").lower()
     nivel_user = profile.get("Nível de experiência", "").lower()
     localizacao_user = profile.get("Localização", "").lower()
-    salario_user = profile.get("Expectativa salarial", "").lower()
     
     # Fator 1: Nível (entry/junior = 10, pleno = 5, senior = 3)
     nivel_score = 3
-    if any(w in titulo for w in ["junior", "júnior", "entry", "graduation", "graduate", "estágio", "trainee"]):
+    if any(w in titulo for w in ["junior", "júnior", "entry", "graduation", "graduate", "estágio", "trainee", "iniciante"]):
         nivel_score = 10
-    elif any(w in titulo for w in ["pleno", "mid", "middle"]):
+    elif any(w in titulo for w in ["pleno", "mid", "middle", "intermediário"]):
         nivel_score = 5
+    elif any(w in titulo for w in ["senior", "sênior", "lead", "principal", "staff"]):
+        nivel_score = 3
     
-    # Fator 2: Uso de IA
+    # Fator 2: Uso de IA (mais inclusivo)
     ia_score = 0
-    if any(w in titulo + " " + descricao for w in ["ai engineer", "machine learning", "ia ", "inteligência artificial", "llm", "genai", "generative ai"]):
-        ia_score = 10
-    elif any(w in titulo + " " + descricao for w in ["ai", "artificial intelligence", "dados", "data scientist", "ml"]):
-        ia_score = 6
-    elif "ia" in descricao or "ai" in descricao:
-        ia_score = 3
+    ia_strong = ["ai engineer", "machine learning engineer", "ml engineer", "llm", "genai", "generative ai", "ia engineer", "engenheiro de ia", "ai developer", "desenvolvedor ia"]
+    ia_medium = ["ai ", "artificial intelligence", "machine learning", "data scientist", "cientista de dados", "ml ", "inteligência artificial", "deep learning", "nlp", "computer vision"]
+    ia_weak = ["ia", "ai", "dados", "data", "analytics", "análise"]
+    # Graduate programmes often have AI/data tracks
+    grad_keywords = ["graduate programme", "graduation program", "programa de graduação", "graduate", "trainee"]
     
-    # Fator 3: Correspondência técnica
-    tech_matches = sum(1 for h in habilidades_user if h and h in descricao)
-    tech_total = len([h for h in habilidades_user if h])
+    if any(w in titulo for w in ia_strong):
+        ia_score = 10
+    elif any(w in titulo + " " + descricao[:500] for w in ia_medium):
+        ia_score = 7
+    elif any(w.lower() in (titulo + " " + descricao).lower() for w in grad_keywords):
+        ia_score = 6  # Graduate programmes often have AI/data tracks
+    elif any(w in descricao for w in ia_weak):
+        ia_score = 4
+    
+    # Fator 3: Correspondência técnica (mais generosa com skills relacionadas)
+    # Mapeamento de skills relacionadas
+    skill_aliases = {
+        "análise de dados": ["data analysis", "data analytics", "análise de dados", "analytics", "pandas", "numpy"],
+        "python": ["python", "pandas", "numpy", "django", "flask", "fastapi"],
+        "sql": ["sql", "postgresql", "mysql", "database", "banco de dados"],
+        "ai": ["ai", "ia", "machine learning", "ml", "deep learning", "llm", "genai"],
+        "pacote office": ["excel", "powerpoint", "word", "office", "spreadsheet"],
+        "photoshop": ["photoshop", "figma", "design", "adobe"],
+    }
+    
+    tech_matches = 0
+    for h in habilidades_user:
+        if not h:
+            continue
+        h_lower = h.lower()
+        # Match direto
+        if h_lower in descricao:
+            tech_matches += 1
+        # Match por alias
+        elif h_lower in skill_aliases:
+            if any(alias in descricao for alias in skill_aliases[h_lower]):
+                tech_matches += 1
+    
+    tech_total = len(habilidades_user)
     tech_score = min(10, int((tech_matches / max(1, tech_total)) * 10)) if tech_total > 0 else 0
     
     # Fator 4: Localização
     loc_score = 3
-    if "remoto" in localizacao_vaga or "remote" in localizacao_vaga:
+    if "remoto" in localizacao_vaga or "remote" in localizacao_vaga or "híbrido" in localizacao_vaga or "hybrid" in localizacao_vaga:
         loc_score = 10
     elif "setúbal" in localizacao_vaga or "sul" in localizacao_vaga:
         loc_score = 10
-    elif "lisboa" in localizacao_vaga or "porto" in localizacao_vaga:
+    elif "lisboa" in localizacao_vaga:
+        loc_score = 5
+    elif "porto" in localizacao_vaga:
         loc_score = 5
     
-    # Fator 5: Salário
-    sal_score = 3
-    salario_text = str(vaga.get("salary", "")).lower()
-    if "1500" in salario_text or "1200" in salario_text or "1300" in salario_text or "1400" in salario_text:
-        sal_score = 10
-    elif any(s in salario_text for s in ["2000", "2500", "3000"]):
-        sal_score = 5
+    # Fator 5: Salário (mais leniente - a maioria não lista salário em Portugal)
+    sal_score = 5  # Default neutro já que a maioria não divulga
+    salary_text = (vaga.get("salary") or extract_salary_from_text(descricao) or "").lower()
+    sal_numbers = re.findall(r"(\d{3,5})", salary_text)
+    if sal_numbers:
+        try:
+            sal_min = min(int(n) for n in sal_numbers)
+            if sal_min <= 1500:
+                sal_score = 10
+            elif sal_min <= 2000:
+                sal_score = 7
+            elif sal_min <= 3000:
+                sal_score = 5
+            else:
+                sal_score = 3
+        except:
+            pass
     
-    # Fator 6: Capacitação
+    # Fator 6: Capacitação (mais inclusivo)
     cap_score = 0
-    if any(w in descricao for w in ["graduate programme", "graduation", "training", "formação", "capacitação", "mentor", "onboarding", "programa de"]):
+    cap_strong = ["graduate programme", "graduation program", "programa de graduação", "programa de trainee", "formação paga", "capacitação", "mentoria", "onboarding", "training program", "desenvolvimento de carreira", "plano de carreira"]
+    cap_medium = ["aprendizado", "desenvolvimento profissional", "crescimento", "certificação", "curso", "bootcamp", "treinamento", "learning", "development"]
+    
+    if any(w in descricao for w in cap_strong):
         cap_score = 10
-    elif any(w in descricao for w in ["aprendizado", "desenvolvimento", "crescimento"]):
-        cap_score = 5
+    elif any(w in descricao for w in cap_medium):
+        cap_score = 6
     
     # Fator 7: Link
     link_status = vaga.get("link_status", "unknown")
@@ -150,7 +310,7 @@ def score_vaga(vaga: Dict, profile: Dict, weights: Dict) -> Dict:
     )
     final_score = int(raw_score * 10)
     
-    # Filtro
+    # Filtros
     filtros = []
     if nivel_score >= 8: filtros.append("entrada")
     if ia_score >= 8: filtros.append("IA")
@@ -169,6 +329,8 @@ def score_vaga(vaga: Dict, profile: Dict, weights: Dict) -> Dict:
         "cap_score": cap_score,
         "link_score": link_score,
         "status_link": link_status,
+        "extracted_salary": extract_salary_from_text(descricao),
+        "extracted_requirements": extract_requirements(descricao),
     }
 
 def parse_profile(profile_text: str) -> Dict:
@@ -196,49 +358,105 @@ def run_scout(dispatch_envelope: Dict) -> Dict:
         elif line.startswith("Localização:"):
             localizacao = line.split(":", 1)[1].strip()
     
-    # Monta query - usa múltiplas queries específicas como no original
-    # Extrai área principal (primeira palavra antes de vírgula)
+    # Monta queries otimizadas para vagas individuais (simples, sem site: que pode não funcionar bem)
     area_main = area.split(",")[0].strip() if area else "tecnologia"
-    queries = []
-    if area_main:
-        queries.append(f"{area_main} Portugal")
-    queries.append("remote AI engineer Portugal")
-    queries.append("remote backend developer Portugal")
-    queries.append("junior AI engineer Portugal")
-    queries.append("junior backend developer Portugal")
-    queries.append("data analyst Portugal remoto")
-    queries.append("junior data analyst Portugal")
+    queries = [
+        f"{area_main} junior Portugal",
+        f"remote AI engineer Portugal junior",
+        f"junior backend developer Portugal",
+        f"junior data analyst Portugal remoto",
+        f"graduate programme technology Portugal",
+        f"trainee program technology Portugal",
+        f"site:volkswagen-group.com junior AI data engineer",
+        f"site:accenture.com graduate programme Portugal",
+        f"site:nokia.com graduate programme Portugal",
+        f"site:sodexo.com data analyst Portugal",
+    ]
     
     all_results = []
-    for q in queries[:5]:  # limita a 5 queries
-        raw_results = run_firecrawl_search(q, limit=8)
+    seen = set()  # Inicializa aqui para usar na extração de jk codes
+    for q in queries[:6]:  # Aumenta para 6 queries
+        raw_results = run_firecrawl_search(q, limit=5)  # Reduz limite
         if raw_results and not (len(raw_results) == 1 and "error" in raw_results[0]):
             all_results.extend(raw_results)
+        time.sleep(1)  # Rate limit amigável
     
-    # Domínios de job boards confiáveis
+    # Extrai códigos jk= do Indeed diretamente dos resultados de busca
+    # Muitas vezes a descrição já contém links viewjob?jk=
+    for item in all_results:
+        desc = item.get("description", "") or item.get("markdown", "")
+        if "indeed" in (item.get("url", "") or item.get("link", "") or ""):
+            jk_codes = re.findall(r'jk=([a-f0-9]{16})', desc)
+            for jk in jk_codes[:3]:
+                job_url = f"https://pt.indeed.com/viewjob?jk={jk}"
+                if job_url not in seen:
+                    all_results.append({"url": job_url, "link": job_url, "title": item.get("title", "Vaga Indeed"), "source": "Indeed (extraída)", "location": item.get("location", "")})
+                    seen.add(job_url)
+    
+    # Domínios de job boards confiáveis + páginas de carreira de empresas
     JOB_BOARD_DOMAINS = [
         "linkedin.com", "glassdoor.com", "indeed.com", "remoterocketship.com",
         "crossover.com", "wellfound.com", "teamlyzer.com", "startup-insider.com",
         "builtin.com", "randstad.pt", "sapo.pt", "net-empregos.com",
         "itjobs.pt", "landing.jobs", "volkswagen-group.com", "accenture.com",
         "nokia.com", "sodexo.com", "iepf.pt",
+        "jobs.volkswagen-group.com", "careers.volkswagen-group.com",
+        "careers.accenture.com", "jobs.accenture.com",
+        "careers.nokia.com", "jobs.nokia.com",
+        "careers.sodexo.com", "jobs.sodexo.com",
     ]
     
     def is_job_board(url: str) -> bool:
         return any(domain in url.lower() for domain in JOB_BOARD_DOMAINS)
     
-    # Filtra apenas job boards
-    raw_results = [r for r in raw_results if is_job_board(r.get("url", "") or r.get("link", ""))]
+    # Filtra job boards + converte Indeed
+    filtered = []
+    search_page_urls = []  # URLs de páginas de busca para extrair vagas individuais
+    for r in all_results:
+        url = r.get("url") or r.get("link") or ""
+        if not url or not is_job_board(url):
+            continue
+        # Converte Indeed jk=
+        url = convert_indeed_link(url)
+        r["url"] = url
+        r["link"] = url
+        # Separa páginas de busca para extrair vagas individuais depois
+        if is_search_page(url):
+            search_page_urls.append(url)
+            continue
+        filtered.append(r)
     
-    # Dedupe por URL
-    seen = set()
+    # Extrai URLs de vagas individuais das páginas de busca (especialmente Indeed)
+    for search_url in search_page_urls[:3]:  # Limita a 3 páginas de busca
+        scrape_result = run_firecrawl_scrape(search_url)
+        if not scrape_result.get("error"):
+            content = scrape_result.get("content", "")
+            parsed = urlparse(search_url)
+            base_domain = parsed.netloc
+            job_urls = extract_job_urls_from_search_page(content, base_domain)
+            
+            # Também extrai códigos jk= do Indeed das descrições
+            if "indeed" in base_domain:
+                jk_codes = re.findall(r'jk=([a-f0-9]{16})', content)
+                for jk in jk_codes[:10]:
+                    job_url = f"https://{base_domain}/viewjob?jk={jk}"
+                    if job_url not in seen:
+                        job_urls.append(job_url)
+            
+            for job_url in job_urls[:5]:  # Max 5 vagas por página de busca
+                if is_job_board(job_url) and job_url not in seen:
+                    filtered.append({"url": job_url, "link": job_url, "title": "Vaga extraída de busca", "source": "Extraída", "location": ""})
+                    seen.add(job_url)
+        time.sleep(1)
+    
+    # Dedupe (seen já foi inicializado acima)
     deduped = []
-    for item in raw_results:
+    for item in filtered:
         url = item.get("url") or item.get("link") or ""
         if url and url not in seen:
             seen.add(url)
             deduped.append(item)
-    raw_results = deduped
+    raw_results = deduped[:12]  # Limita para não estourar tempo
     
     if not raw_results or (len(raw_results) == 1 and "error" in raw_results[0]):
         return {
@@ -259,7 +477,6 @@ def run_scout(dispatch_envelope: Dict) -> Dict:
         link_status = check_link_status(url)
         if link_status in ("403", "429"):
             # Tenta novamente após espera
-            import time
             time.sleep(30)
             link_status = check_link_status(url)
         
@@ -296,22 +513,23 @@ def run_scout(dispatch_envelope: Dict) -> Dict:
             "score_metrics": vaga_scored["score_metrics"],
             "filtro": vaga_scored["filtro"],
             "status_link": vaga_scored["status_link"],
+            "salario_extraido": vaga_scored.get("extracted_salary", ""),
+            "requisitos_extraidos": vaga_scored.get("extracted_requirements", []),
         }
         vagas_processadas.append(vaga_final)
     
-    # Filtra score >= 45 (temporário para demo) e ordena
-    vagas_filtradas = [v for v in vagas_processadas if v["score_metrics"] >= 45]
+    # Filtra score >= 58 (prático para dados reais) e ordena
+    vagas_filtradas = [v for v in vagas_processadas if v["score_metrics"] >= 58]
     vagas_filtradas.sort(key=lambda x: x["score_metrics"], reverse=True)
     top_vagas = vagas_filtradas[:5]
     
-    # Debug: mostra scores de todas
     debug_scores = [(v["titulo"], v["score_metrics"], v["filtro"]) for v in vagas_processadas]
     
     return {
         "estado": "sucesso" if top_vagas else "erro",
-        "resumo": f"Encontradas {len(top_vagas)} vagas compatíveis (score ≥ 45) de {len(vagas_processadas)} analisadas. Scores: {debug_scores}",
+        "resumo": f"Encontradas {len(top_vagas)} vagas compatíveis (score ≥ 58) de {len(vagas_processadas)} analisadas. Scores: {debug_scores}",
         "dados": top_vagas,
-        "erros": [] if top_vagas else ["Nenhuma vaga atingiu score mínimo 45"],
+        "erros": [] if top_vagas else ["Nenhuma vaga atingiu score mínimo 58"],
     }
 
 def main():
