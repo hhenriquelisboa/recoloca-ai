@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+
+# Firecrawl cache
+.firecrawl/
+
+# Data files (opcional - decidir se commit ou não)
+# data/job-search-results.md
+# data/vagas-entrada-ia-capacitacao.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
